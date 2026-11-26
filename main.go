@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -50,6 +51,10 @@ var requestCount int64
 
 var body []byte
 
+var w *tabwriter.Writer
+
+var logFile *os.File
+
 func main() {
 	// Флаги с дефолтами
 	urlFlag := flag.String("url", "http://localhost:8080", "URL на который будут отправляться запросы.")
@@ -73,15 +78,17 @@ func main() {
 	sessionId = *sessionIdHeaderFlag
 	rps = *rpsFlag
 	requestCount = *requestCountFlag
+	isDebug = *isDebugFlag
 
-	if *isDebugFlag {
-		isDebug = *isDebugFlag
-		logFile := getLogFile()
+	if isDebug {
+		logFile = getLogFile()
 		defer logFile.Close()
 
 		logger = slog.New(slog.NewTextHandler(io.MultiWriter(os.Stdout, logFile), nil))
+		w = tabwriter.NewWriter(io.MultiWriter(os.Stdout, logFile), 0, 0, 3, ' ', 0)
 	} else {
 		logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
+		w = tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	}
 
 	if rps <= 0 || *vuCount <= 0 || requestCount <= 0 || *testDuration <= 0 {
@@ -110,7 +117,6 @@ func main() {
 
 	if graphQlPath != "" {
 		method = postMethod
-
 		marshaled, err := json.Marshal(struct {
 			Query string `json:"query"`
 		}{
@@ -140,11 +146,13 @@ func main() {
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(*testDuration)*time.Second)
 	defer cancel()
 
-	fmt.Println("==================================================== Начало тестирования ====================================================")
-	fmt.Printf("Метод: %s, URL: %s, VUs: %d, RPS: %f, Максимум запросов: %d\n", method, url+graphQlPath, *vuCount, rps, requestCount)
+	fmt.Fprintln(w, "==================================================== Начало тестирования ====================================================")
+	fmt.Fprintf(w, "Метод: %s, URL: %s, VUs: %d, RPS: %f, Максимум запросов: %d\n\n", method, url+graphQlPath, *vuCount, rps, requestCount)
 	if len(body) > 0 {
-		fmt.Printf("Тело запроса: %q\n\n", body)
+		fmt.Fprintf(w, "Тело запроса: %q\n\n", body)
 	}
+
+	w.Flush()
 
 	results := make(map[string][]time.Duration)
 	resultsChan := make(chan Result, 20)
@@ -203,7 +211,7 @@ func runVU(vuWg *sync.WaitGroup, ctx context.Context, sentCount *atomic.Int64, c
 func sendRequest(ctx context.Context, reqWg *sync.WaitGroup, client *http.Client, body []byte, current int64, resultsChan chan Result) {
 	defer reqWg.Done()
 	reqStart := time.Now()
-	resp, err := client.Do(createRequest(ctx, method, url, graphQlPath, sessionId, body))
+	resp, err := client.Do(createRequest(ctx, body))
 	since := time.Since(reqStart)
 
 	if err != nil {
@@ -249,12 +257,12 @@ func sendRequest(ctx context.Context, reqWg *sync.WaitGroup, client *http.Client
 func writeResult(start time.Time, results map[string][]time.Duration) {
 	totalDuration := time.Since(start)
 	var reqsTotal int
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 
-	fmt.Printf("\n==================================================== Тест окончен ====================================================\n")
+	fmt.Fprintf(w, "\n==================================================== Тест окончен ====================================================\n")
 	fmt.Fprintf(w, "Результат запроса\tКол-во запросов\tСреднее арифметическое\tp50(медиана)\tp90\tp95")
 
-	for code := range results {
+	codes := slices.Sorted(maps.Keys(results))
+	for _, code := range codes {
 		codeResultsLen := len(results[code])
 		reqsTotal += codeResultsLen
 		var codeDurationTotal time.Duration
@@ -271,9 +279,9 @@ func writeResult(start time.Time, results map[string][]time.Duration) {
 
 		fmt.Fprintf(w, "\n%s\t%d\t%v\t%v\t%v\t%v", code, codeResultsLen, avg.Round(time.Millisecond), p50, p90, p95)
 	}
+	fmt.Fprintf(w, "\n\nОбщее количество запросов: %d", reqsTotal)
+	fmt.Fprintf(w, "\nОбщее время: %v\n", totalDuration.Round(100*time.Millisecond))
 	w.Flush()
-	fmt.Printf("\n\nОбщее количество запросов: %d", reqsTotal)
-	fmt.Printf("\nОбщее время: %v\n", totalDuration.Round(100*time.Millisecond))
 }
 
 func logInfo(message string, args ...any) {
@@ -292,7 +300,7 @@ func logError(message string, err error) {
 	}
 }
 
-func createRequest(ctx context.Context, method, url, graphQlPath, sessionIdHeader string, body []byte) *http.Request {
+func createRequest(ctx context.Context, body []byte) *http.Request {
 	req, err := http.NewRequestWithContext(ctx, method, url+graphQlPath, bytes.NewReader(body))
 	if err != nil {
 		logError("Невозможно сгенерировать запрос", err)
@@ -305,8 +313,8 @@ func createRequest(ctx context.Context, method, url, graphQlPath, sessionIdHeade
 		req.Header.Add("Content-Type", "application/json")
 	}
 
-	if sessionIdHeader != "" {
-		req.Header.Add("Cookie", fmt.Sprintf("sessionId=%s", sessionIdHeader))
+	if sessionId != "" {
+		req.Header.Add("Cookie", fmt.Sprintf("sessionId=%s", sessionId))
 	}
 	return req
 }
